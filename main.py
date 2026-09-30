@@ -8,8 +8,11 @@ from faster_whisper import WhisperModel
 
 CLIENT_ID = os.environ["TWITCH_CLIENT_ID"]
 CLIENT_SECRET = os.environ["TWITCH_CLIENT_SECRET"]
-CANAL = "westcol"
-MAX_CLIPS = 3
+
+# Nombres de usuario de Twitch (lo que va en twitch.tv/NOMBRE)
+CANALES = ["optical", "byking", "locolucas", "lujo", "goti"]
+MAX_CLIPS_POR_CANAL = 2
+DIAS = 7
 
 OUT = Path("output")
 TMP = Path("tmp")
@@ -47,63 +50,87 @@ def srt_time(t):
     return f"{h:02d}:{m:02d}:{s:06.3f}".replace(".", ",")
 
 
+def procesar_clip(c, model, nombre):
+    cid = c["id"]
+    raw = TMP / f"{cid}.mp4"
+    vertical = TMP / f"{cid}_v.mp4"
+    srt = TMP / f"{cid}.srt"
+    final = OUT / f"{nombre}_{cid}.mp4"
+
+    # 1. descargar
+    subprocess.run(["yt-dlp", "-o", str(raw), c["url"]], check=True)
+
+    # 2. vertical 9:16 con fondo difuminado
+    vf = (
+        "[0:v]split[a][b];"
+        "[a]scale=1080:1920:force_original_aspect_ratio=increase,"
+        "crop=1080:1920,boxblur=20:5[bg];"
+        "[b]scale=1080:-2[fg];"
+        "[bg][fg]overlay=(W-w)/2:(H-h)/2"
+    )
+    subprocess.run(
+        ["ffmpeg", "-y", "-i", str(raw), "-filter_complex", vf,
+         "-c:a", "copy", str(vertical)],
+        check=True,
+    )
+
+    # 3. subtitulos
+    segments, _ = model.transcribe(str(raw), language="es")
+    with open(srt, "w", encoding="utf-8") as f:
+        for i, s in enumerate(segments, 1):
+            f.write(f"{i}\n{srt_time(s.start)} --> {srt_time(s.end)}\n{s.text.strip()}\n\n")
+
+    subprocess.run(
+        ["ffmpeg", "-y", "-i", str(vertical),
+         "-vf", f"subtitles={srt}:force_style='Alignment=2,FontSize=16,MarginV=200'",
+         "-c:a", "copy", str(final)],
+        check=True,
+    )
+
+    # 4. titulo y descripcion con credito
+    titulo = f"{c['title']} | {nombre}"
+    desc = (
+        f"Clip original: {c['url']}\n"
+        f"Clip por {c['creator_name']} en Twitch\n"
+        f"Canal: twitch.tv/{nombre}"
+    )
+    (OUT / f"{nombre}_{cid}.txt").write_text(f"{titulo}\n\n{desc}", encoding="utf-8")
+    print("Listo:", final)
+
+
 def main():
     token = get_token()
-    user = api("users", {"login": CANAL}, token)[0]
-    desde = (datetime.utcnow() - timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
-    clips = api(
-        "clips",
-        {"broadcaster_id": user["id"], "started_at": desde, "first": MAX_CLIPS},
-        token,
-    )
-    if not clips:
-        print("No hay clips nuevos hoy.")
-        return
+    desde = (datetime.utcnow() - timedelta(days=DIAS)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    model = None
+    total = 0
 
-    model = WhisperModel("base", device="cpu", compute_type="int8")
+    for canal in CANALES:
+        users = api("users", {"login": canal}, token)
+        if not users:
+            print(f"[{canal}] no existe en Twitch con ese nombre, lo salto.")
+            continue
 
-    for c in clips:
-        cid = c["id"]
-        raw = TMP / f"{cid}.mp4"
-        vertical = TMP / f"{cid}_v.mp4"
-        srt = TMP / f"{cid}.srt"
-        final = OUT / f"{cid}.mp4"
-
-        # 1. descargar
-        subprocess.run(["yt-dlp", "-o", str(raw), c["url"]], check=True)
-
-        # 2. pasar a vertical 9:16 con fondo difuminado
-        vf = (
-            "[0:v]split[a][b];"
-            "[a]scale=1080:1920:force_original_aspect_ratio=increase,"
-            "crop=1080:1920,boxblur=20:5[bg];"
-            "[b]scale=1080:-2[fg];"
-            "[bg][fg]overlay=(W-w)/2:(H-h)/2"
+        clips = api(
+            "clips",
+            {"broadcaster_id": users[0]["id"], "started_at": desde,
+             "first": MAX_CLIPS_POR_CANAL},
+            token,
         )
-        subprocess.run(
-            ["ffmpeg", "-y", "-i", str(raw), "-filter_complex", vf,
-             "-c:a", "copy", str(vertical)],
-            check=True,
-        )
+        print(f"[{canal}] clips encontrados: {len(clips)}")
+        if not clips:
+            continue
 
-        # 3. subtitulos
-        segments, _ = model.transcribe(str(raw), language="es")
-        with open(srt, "w", encoding="utf-8") as f:
-            for i, s in enumerate(segments, 1):
-                f.write(f"{i}\n{srt_time(s.start)} --> {srt_time(s.end)}\n{s.text.strip()}\n\n")
+        if model is None:
+            model = WhisperModel("base", device="cpu", compute_type="int8")
 
-        subprocess.run(
-            ["ffmpeg", "-y", "-i", str(vertical),
-             "-vf", f"subtitles={srt}:force_style='Alignment=2,FontSize=16,MarginV=200'",
-             "-c:a", "copy", str(final)],
-            check=True,
-        )
+        for c in clips:
+            try:
+                procesar_clip(c, model, canal)
+                total += 1
+            except Exception as e:
+                print(f"[{canal}] fallo el clip {c['id']}: {e}")
 
-        # 4. titulo y descripcion con credito
-        titulo = f"{c['title']} | Westcol"
-        desc = f"Clip original: {c['url']}\nClip por {c['creator_name']} en Twitch\nCanal: twitch.tv/{CANAL}"
-        (OUT / f"{cid}.txt").write_text(f"{titulo}\n\n{desc}", encoding="utf-8")
-        print("Listo:", final)
+    print(f"Total de clips listos: {total}")
 
 
 if __name__ == "__main__":
