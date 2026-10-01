@@ -10,9 +10,9 @@ CLIENT_ID = os.environ["TWITCH_CLIENT_ID"]
 CLIENT_SECRET = os.environ["TWITCH_CLIENT_SECRET"]
 
 # Nombres de usuario de Twitch (lo que va en twitch.tv/NOMBRE)
-CANALES = ["optical", "byking", "locolucas", "lujo", "goti"]
-MAX_CLIPS_POR_CANAL = 2
-DIAS = 7
+CANALES = ["optical", "byking", "locolucas", "lujo", "goti", "elmariana", "coscu", "davooxeneize", "momo", "lolitofdez", "spreen", "nicocapo", "bananirou", "overtflow", "ibai", "auronplay", "thegrefg", "elxokas", "knekro", "elmillor", "illojuan", "rubius", "ampeterby7", "tazercraft", "komanche", "carreraaa"]
+MAX_CLIPS_POR_CANAL = 1
+DIAS = 30
 
 OUT = Path("output")
 TMP = Path("tmp")
