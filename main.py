@@ -1,17 +1,22 @@
 import os
 import subprocess
+import sys
 from datetime import datetime, timedelta
 from pathlib import Path
 
 import requests
 from faster_whisper import WhisperModel
 
+# Que el registro de GitHub muestre cada linea al instante
+sys.stdout.reconfigure(line_buffering=True)
+
 CLIENT_ID = os.environ["TWITCH_CLIENT_ID"]
 CLIENT_SECRET = os.environ["TWITCH_CLIENT_SECRET"]
 
 # Nombres de usuario de Twitch (lo que va en twitch.tv/NOMBRE)
 CANALES = ["optical", "byking", "locolucas", "lujo", "goti", "elmariana", "coscu", "davooxeneize", "momo", "lolitofdez", "spreen", "nicocapo", "bananirou", "overtflow", "ibai", "auronplay", "thegrefg", "elxokas", "knekro", "elmillor", "illojuan", "rubius", "ampeterby7", "tazercraft", "komanche", "carreraaa"]
-MAX_CLIPS_POR_CANAL = 1
+MAX_CLIPS_POR_CANAL = 1   # clips que se piden por canal al revisar
+MAX_CLIPS_TOTAL = 6       # clips que realmente se procesan (los mas vistos)
 DIAS = 30
 
 OUT = Path("output")
@@ -28,6 +33,7 @@ def get_token():
             "client_secret": CLIENT_SECRET,
             "grant_type": "client_credentials",
         },
+        timeout=30,
     )
     r.raise_for_status()
     return r.json()["access_token"]
@@ -38,6 +44,7 @@ def api(path, params, token):
         f"https://api.twitch.tv/helix/{path}",
         params=params,
         headers={"Client-Id": CLIENT_ID, "Authorization": f"Bearer {token}"},
+        timeout=30,
     )
     r.raise_for_status()
     return r.json()["data"]
@@ -53,38 +60,33 @@ def srt_time(t):
 def procesar_clip(c, model, nombre):
     cid = c["id"]
     raw = TMP / f"{cid}.mp4"
-    vertical = TMP / f"{cid}_v.mp4"
     srt = TMP / f"{cid}.srt"
     final = OUT / f"{nombre}_{cid}.mp4"
 
     # 1. descargar
-    subprocess.run(["yt-dlp", "-o", str(raw), c["url"]], check=True)
+    subprocess.run(["yt-dlp", "-q", "-o", str(raw), c["url"]], check=True, timeout=180)
 
-    # 2. vertical 9:16 con fondo difuminado
-    vf = (
-        "[0:v]split[a][b];"
-        "[a]scale=1080:1920:force_original_aspect_ratio=increase,"
-        "crop=1080:1920,boxblur=20:5[bg];"
-        "[b]scale=1080:-2[fg];"
-        "[bg][fg]overlay=(W-w)/2:(H-h)/2"
-    )
-    subprocess.run(
-        ["ffmpeg", "-y", "-i", str(raw), "-filter_complex", vf,
-         "-c:a", "copy", str(vertical)],
-        check=True,
-    )
-
-    # 3. subtitulos
+    # 2. subtitulos (IA que transcribe el audio)
     segments, _ = model.transcribe(str(raw), language="es")
     with open(srt, "w", encoding="utf-8") as f:
         for i, s in enumerate(segments, 1):
             f.write(f"{i}\n{srt_time(s.start)} --> {srt_time(s.end)}\n{s.text.strip()}\n\n")
 
+    # 3. vertical 9:16 + subtitulos, todo en una sola pasada (mas rapido)
+    vf = (
+        "[0:v]split[a][b];"
+        "[a]scale=720:1280:force_original_aspect_ratio=increase,"
+        "crop=720:1280,boxblur=20:5[bg];"
+        "[b]scale=720:-2[fg];"
+        "[bg][fg]overlay=(W-w)/2:(H-h)/2[v];"
+        f"[v]subtitles={srt}:force_style='Alignment=2,FontSize=14,MarginV=140'[out]"
+    )
     subprocess.run(
-        ["ffmpeg", "-y", "-i", str(vertical),
-         "-vf", f"subtitles={srt}:force_style='Alignment=2,FontSize=16,MarginV=200'",
+        ["ffmpeg", "-y", "-loglevel", "error", "-i", str(raw),
+         "-filter_complex", vf, "-map", "[out]", "-map", "0:a?",
+         "-c:v", "libx264", "-preset", "veryfast", "-crf", "26",
          "-c:a", "copy", str(final)],
-        check=True,
+        check=True, timeout=300,
     )
 
     # 4. titulo y descripcion con credito
@@ -101,36 +103,50 @@ def procesar_clip(c, model, nombre):
 def main():
     token = get_token()
     desde = (datetime.utcnow() - timedelta(days=DIAS)).strftime("%Y-%m-%dT%H:%M:%SZ")
-    model = None
-    total = 0
 
+    # PASO 1: revisar todos los canales (rapido, solo consultas)
+    print("=== REVISANDO CANALES ===")
+    candidatos = []
     for canal in CANALES:
-        users = api("users", {"login": canal}, token)
-        if not users:
-            print(f"[{canal}] no existe en Twitch con ese nombre, lo salto.")
+        try:
+            users = api("users", {"login": canal}, token)
+            if not users:
+                print(f"[{canal}] NO EXISTE en Twitch con ese nombre")
+                continue
+            clips = api(
+                "clips",
+                {"broadcaster_id": users[0]["id"], "started_at": desde,
+                 "first": MAX_CLIPS_POR_CANAL},
+                token,
+            )
+        except Exception as e:
+            print(f"[{canal}] error al consultar: {e}")
             continue
-
-        clips = api(
-            "clips",
-            {"broadcaster_id": users[0]["id"], "started_at": desde,
-             "first": MAX_CLIPS_POR_CANAL},
-            token,
-        )
-        print(f"[{canal}] clips encontrados: {len(clips)}")
-        if not clips:
-            continue
-
-        if model is None:
-            model = WhisperModel("base", device="cpu", compute_type="int8")
-
+        print(f"[{canal}] existe, clips encontrados: {len(clips)}")
         for c in clips:
-            try:
-                procesar_clip(c, model, canal)
-                total += 1
-            except Exception as e:
-                print(f"[{canal}] fallo el clip {c['id']}: {e}")
+            candidatos.append((canal, c))
 
-    print(f"Total de clips listos: {total}")
+    print(f"\nCanales con clips: {len(set(n for n, _ in candidatos))} de {len(CANALES)}")
+    if not candidatos:
+        print("No hay clips para procesar.")
+        return
+
+    # PASO 2: procesar solo los mas vistos
+    candidatos.sort(key=lambda x: x[1].get("view_count", 0), reverse=True)
+    elegidos = candidatos[:MAX_CLIPS_TOTAL]
+    print(f"\n=== PROCESANDO {len(elegidos)} CLIPS ===")
+
+    model = WhisperModel("base", device="cpu", compute_type="int8")
+    total = 0
+    for canal, c in elegidos:
+        try:
+            print(f"[{canal}] procesando: {c['title']}")
+            procesar_clip(c, model, canal)
+            total += 1
+        except Exception as e:
+            print(f"[{canal}] fallo el clip {c['id']}: {e}")
+
+    print(f"\nTotal de clips listos: {total}")
 
 
 if __name__ == "__main__":
