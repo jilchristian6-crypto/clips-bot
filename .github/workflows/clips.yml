@@ -5,10 +5,13 @@ on:
     - cron: "0 14 * * *"
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   run:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -20,7 +23,19 @@ jobs:
         env:
           TWITCH_CLIENT_ID: ${{ secrets.TWITCH_CLIENT_ID }}
           TWITCH_CLIENT_SECRET: ${{ secrets.TWITCH_CLIENT_SECRET }}
+          YT_CLIENT_ID: ${{ secrets.YT_CLIENT_ID }}
+          YT_CLIENT_SECRET: ${{ secrets.YT_CLIENT_SECRET }}
+          YT_REFRESH_TOKEN: ${{ secrets.YT_REFRESH_TOKEN }}
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: clips
           path: output/
+          retention-days: 7
+      - name: Guardar lista de clips ya subidos
+        if: always()
+        run: |
+          git config user.name "clips-bot"
+          git config user.email "clips-bot@users.noreply.github.com"
+          git add procesados.txt
+          git diff --cached --quiet || (git commit -m "actualizar clips procesados" && git push)
