@@ -18,6 +18,8 @@ CANALES = ["optical", "byking", "locolucas", "lujo", "goti", "elmariana", "coscu
 MAX_CLIPS_POR_CANAL = 1   # clips que se piden por canal al revisar
 MAX_CLIPS_TOTAL = 6       # clips que realmente se procesan (los mas vistos)
 DIAS = 30
+RECORTE_ABAJO = 0.10      # % del borde inferior que se corta para tapar subtitulos del propio clip (0 = no cortar)
+MODELO_WHISPER = "small"  # mas preciso que "base"
 
 OUT = Path("output")
 TMP = Path("tmp")
@@ -67,14 +69,34 @@ def procesar_clip(c, model, nombre):
     subprocess.run(["yt-dlp", "-q", "-o", str(raw), c["url"]], check=True, timeout=180)
 
     # 2. subtitulos (IA que transcribe el audio)
-    segments, _ = model.transcribe(str(raw), language="es")
+    segments, _ = model.transcribe(
+        str(raw),
+        language="es",
+        vad_filter=True,                    # ignora silencios y ruido (evita texto inventado)
+        condition_on_previous_text=False,   # evita que repita lo anterior
+        beam_size=5,
+    )
+    limpios = []
+    for s in segments:
+        texto = s.text.strip()
+        if not texto:
+            continue
+        # saltar lineas repetidas seguidas
+        if limpios and texto.lower() == limpios[-1][2].lower():
+            limpios[-1][1] = s.end
+            continue
+        limpios.append([s.start, s.end, texto])
+    # que nunca se solapen dos subtitulos
+    for i in range(len(limpios) - 1):
+        if limpios[i][1] > limpios[i + 1][0]:
+            limpios[i][1] = limpios[i + 1][0]
     with open(srt, "w", encoding="utf-8") as f:
-        for i, s in enumerate(segments, 1):
-            f.write(f"{i}\n{srt_time(s.start)} --> {srt_time(s.end)}\n{s.text.strip()}\n\n")
+        for i, (ini, fin, texto) in enumerate(limpios, 1):
+            f.write(f"{i}\n{srt_time(ini)} --> {srt_time(fin)}\n{texto}\n\n")
 
     # 3. vertical 9:16 + subtitulos, todo en una sola pasada (mas rapido)
     vf = (
-        "[0:v]split[a][b];"
+        f"[0:v]crop=iw:trunc(ih*{1 - RECORTE_ABAJO}/2)*2:0:0,split[a][b];"
         "[a]scale=720:1280:force_original_aspect_ratio=increase,"
         "crop=720:1280,boxblur=20:5[bg];"
         "[b]scale=720:-2[fg];"
@@ -136,7 +158,7 @@ def main():
     elegidos = candidatos[:MAX_CLIPS_TOTAL]
     print(f"\n=== PROCESANDO {len(elegidos)} CLIPS ===")
 
-    model = WhisperModel("base", device="cpu", compute_type="int8")
+    model = WhisperModel(MODELO_WHISPER, device="cpu", compute_type="int8")
     total = 0
     for canal, c in elegidos:
         try:
